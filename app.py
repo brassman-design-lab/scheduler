@@ -9,12 +9,15 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dateparser
+from sqlalchemy import create_engine, text
 
 st.set_page_config(page_title="Daily Schedule Builder", layout="wide")
 
 COLUMNS = ["Task", "Date", "Category", "Notes", "Source", "_id"]
 HIDDEN_COLUMNS = ["Source", "_id"]
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks_data.csv")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+DB_TABLE = "tasks"
 
 TASK_KEYWORDS = ["task", "title", "name", "item", "activity", "description", "subject"]
 DATE_KEYWORDS = ["date", "due", "deadline", "when", "day"]
@@ -58,13 +61,7 @@ def empty_df():
     return pd.DataFrame(columns=COLUMNS)
 
 
-def load_tasks():
-    if not os.path.exists(DATA_FILE):
-        return empty_df()
-    try:
-        df = pd.read_csv(DATA_FILE)
-    except (pd.errors.EmptyDataError, OSError):
-        return empty_df()
+def normalize_loaded_df(df):
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     for col in COLUMNS:
@@ -75,8 +72,53 @@ def load_tasks():
     return df[COLUMNS]
 
 
+@st.cache_resource
+def get_engine():
+    if not DATABASE_URL:
+        return None
+    return create_engine(DATABASE_URL, pool_pre_ping=True)
+
+
+def load_tasks():
+    engine = get_engine()
+    if engine is None:
+        if not os.path.exists(DATA_FILE):
+            return empty_df()
+        try:
+            df = pd.read_csv(DATA_FILE)
+        except (pd.errors.EmptyDataError, OSError):
+            return empty_df()
+        return normalize_loaded_df(df)
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""CREATE TABLE IF NOT EXISTS {DB_TABLE} (
+                    "_id" TEXT PRIMARY KEY,
+                    "Task" TEXT,
+                    "Date" TIMESTAMP,
+                    "Category" TEXT,
+                    "Notes" TEXT,
+                    "Source" TEXT
+                )"""
+            )
+        )
+        df = pd.read_sql_query(text(f'SELECT * FROM {DB_TABLE}'), conn)
+    if df.empty:
+        return empty_df()
+    return normalize_loaded_df(df)
+
+
 def save_tasks():
-    st.session_state.tasks_df.to_csv(DATA_FILE, index=False)
+    engine = get_engine()
+    if engine is None:
+        st.session_state.tasks_df.to_csv(DATA_FILE, index=False)
+        return
+    df = st.session_state.tasks_df.copy()
+    with engine.begin() as conn:
+        conn.execute(text(f"DELETE FROM {DB_TABLE}"))
+        if not df.empty:
+            df.to_sql(DB_TABLE, conn, if_exists="append", index=False)
 
 
 if "tasks_df" not in st.session_state:
