@@ -242,7 +242,9 @@ st.caption(
     "(Social Media, Advertising, Product Design/Execution, or Other), then lays them out on a weekly calendar."
 )
 
-with st.expander("Upload files", expanded=True):
+tab_calendar, tab_upload, tab_manual = st.tabs(["Weekly calendar", "Upload files", "Add a task manually"])
+
+with tab_upload:
     uploaded_files = st.file_uploader(
         "Spreadsheets or PDFs",
         type=["csv", "tsv", "xlsx", "xls", "pdf"],
@@ -304,9 +306,7 @@ with st.expander("Upload files", expanded=True):
             except Exception as e:
                 st.error(f"Couldn't parse {uf.name}: {e}")
 
-st.divider()
-
-with st.expander("Add a task manually"):
+with tab_manual:
     with st.form("manual_add", clear_on_submit=True):
         mc1, mc2, mc3, mc4 = st.columns([2, 1, 1.5, 2])
         m_task = mc1.text_input("Task")
@@ -318,120 +318,119 @@ with st.expander("Add a task manually"):
             append_tasks([m_task], [m_date], [m_notes], category, "manual")
             st.success("Task added.")
 
-st.divider()
+with tab_calendar:
+    df = st.session_state.tasks_df.copy()
 
-df = st.session_state.tasks_df.copy()
+    if df.empty:
+        st.info("No tasks yet — upload a file above or add one manually.")
+    else:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        unscheduled = df[df["Date"].isna()]
+        scheduled = df[df["Date"].notna()].sort_values("Date")
 
-if df.empty:
-    st.info("No tasks yet — upload a file above or add one manually.")
-else:
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    unscheduled = df[df["Date"].isna()]
-    scheduled = df[df["Date"].notna()].sort_values("Date")
+        top_col1, top_col2 = st.columns([3, 1])
+        with top_col2:
+            csv_buf = io.StringIO()
+            export_df = pd.concat([scheduled, unscheduled]).drop(columns=HIDDEN_COLUMNS, errors="ignore")
+            export_df.to_csv(csv_buf, index=False)
+            st.download_button(
+                "Export schedule as CSV",
+                data=csv_buf.getvalue(),
+                file_name="daily_schedule.csv",
+                mime="text/csv",
+            )
+            if st.button("Clear all tasks"):
+                st.session_state.tasks_df = empty_df()
+                save_tasks()
+                st.rerun()
 
-    top_col1, top_col2 = st.columns([3, 1])
-    with top_col2:
-        csv_buf = io.StringIO()
-        export_df = pd.concat([scheduled, unscheduled]).drop(columns=HIDDEN_COLUMNS, errors="ignore")
-        export_df.to_csv(csv_buf, index=False)
-        st.download_button(
-            "Export schedule as CSV",
-            data=csv_buf.getvalue(),
-            file_name="daily_schedule.csv",
-            mime="text/csv",
-        )
-        if st.button("Clear all tasks"):
-            st.session_state.tasks_df = empty_df()
+        if not unscheduled.empty:
+            st.subheader(f"Unscheduled ({len(unscheduled)})")
+            st.caption("No date could be found for these — edit the Date column to slot them in.")
+            edited_unsched = st.data_editor(
+                unscheduled.drop(columns=HIDDEN_COLUMNS, errors="ignore"),
+                num_rows="dynamic",
+                use_container_width=True,
+                key="unscheduled_editor",
+                column_config={
+                    "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
+                },
+            )
+            st.session_state.tasks_df.update(edited_unsched)
             save_tasks()
-            st.rerun()
 
-    if not unscheduled.empty:
-        st.subheader(f"Unscheduled ({len(unscheduled)})")
-        st.caption("No date could be found for these — edit the Date column to slot them in.")
-        edited_unsched = st.data_editor(
-            unscheduled.drop(columns=HIDDEN_COLUMNS, errors="ignore"),
+        st.divider()
+        st.subheader("Weekly calendar")
+
+        if "week_start" not in st.session_state:
+            today = pd.Timestamp.today().normalize().date()
+            st.session_state.week_start = today - timedelta(days=today.weekday())
+
+        nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 5])
+        if nav1.button("◀ Prev week"):
+            st.session_state.week_start -= timedelta(days=7)
+        if nav2.button("Today"):
+            today = pd.Timestamp.today().normalize().date()
+            st.session_state.week_start = today - timedelta(days=today.weekday())
+        if nav3.button("Next week ▶"):
+            st.session_state.week_start += timedelta(days=7)
+
+        week_start = st.session_state.week_start
+        week_end = week_start + timedelta(days=6)
+        st.caption(f"{week_start.strftime('%B %d')} – {week_end.strftime('%B %d, %Y')}")
+
+        week_mask = (scheduled["Date"].dt.date >= week_start) & (scheduled["Date"].dt.date <= week_end)
+        week_df = scheduled[week_mask]
+
+        st.markdown(CALENDAR_CSS, unsafe_allow_html=True)
+        with st.container(key="calendar_grid"):
+            day_cols = st.columns(7)
+            for i, col in enumerate(day_cols):
+                day = week_start + timedelta(days=i)
+                day_tasks = week_df[week_df["Date"].dt.date == day]
+                with col:
+                    is_today = day == pd.Timestamp.today().normalize().date()
+                    header = f"**{day.strftime('%a %-m/%-d')}**" if not is_today else f"**{day.strftime('%a %-m/%-d')} 🔵**"
+                    st.markdown(header)
+                    if day_tasks.empty:
+                        st.caption("—")
+                    else:
+                        for cat in CATEGORIES:
+                            cat_tasks = day_tasks[day_tasks["Category"] == cat]
+                            if cat_tasks.empty:
+                                continue
+                            emoji = CATEGORY_META[cat]["emoji"]
+                            st.caption(f"{emoji} {cat}")
+                            for _, row in cat_tasks.iterrows():
+                                render_task_capsule(row)
+
+        st.markdown("##### Edit this week's tasks")
+        edited_week = st.data_editor(
+            week_df.drop(columns=HIDDEN_COLUMNS, errors="ignore"),
             num_rows="dynamic",
             use_container_width=True,
-            key="unscheduled_editor",
+            key=f"week_editor_{week_start}",
             column_config={
                 "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
             },
         )
-        st.session_state.tasks_df.update(edited_unsched)
+        st.session_state.tasks_df.update(edited_week)
         save_tasks()
 
-    st.divider()
-    st.subheader("Weekly calendar")
-
-    if "week_start" not in st.session_state:
-        today = pd.Timestamp.today().normalize().date()
-        st.session_state.week_start = today - timedelta(days=today.weekday())
-
-    nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 5])
-    if nav1.button("◀ Prev week"):
-        st.session_state.week_start -= timedelta(days=7)
-    if nav2.button("Today"):
-        today = pd.Timestamp.today().normalize().date()
-        st.session_state.week_start = today - timedelta(days=today.weekday())
-    if nav3.button("Next week ▶"):
-        st.session_state.week_start += timedelta(days=7)
-
-    week_start = st.session_state.week_start
-    week_end = week_start + timedelta(days=6)
-    st.caption(f"{week_start.strftime('%B %d')} – {week_end.strftime('%B %d, %Y')}")
-
-    week_mask = (scheduled["Date"].dt.date >= week_start) & (scheduled["Date"].dt.date <= week_end)
-    week_df = scheduled[week_mask]
-
-    st.markdown(CALENDAR_CSS, unsafe_allow_html=True)
-    with st.container(key="calendar_grid"):
-        day_cols = st.columns(7)
-        for i, col in enumerate(day_cols):
-            day = week_start + timedelta(days=i)
-            day_tasks = week_df[week_df["Date"].dt.date == day]
-            with col:
-                is_today = day == pd.Timestamp.today().normalize().date()
-                header = f"**{day.strftime('%a %-m/%-d')}**" if not is_today else f"**{day.strftime('%a %-m/%-d')} 🔵**"
-                st.markdown(header)
-                if day_tasks.empty:
-                    st.caption("—")
-                else:
-                    for cat in CATEGORIES:
-                        cat_tasks = day_tasks[day_tasks["Category"] == cat]
-                        if cat_tasks.empty:
-                            continue
-                        emoji = CATEGORY_META[cat]["emoji"]
-                        st.caption(f"{emoji} {cat}")
-                        for _, row in cat_tasks.iterrows():
-                            render_task_capsule(row)
-
-    st.markdown("##### Edit this week's tasks")
-    edited_week = st.data_editor(
-        week_df.drop(columns=HIDDEN_COLUMNS, errors="ignore"),
-        num_rows="dynamic",
-        use_container_width=True,
-        key=f"week_editor_{week_start}",
-        column_config={
-            "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
-        },
-    )
-    st.session_state.tasks_df.update(edited_week)
-    save_tasks()
-
-    outside_week = scheduled[~week_mask]
-    if not outside_week.empty:
-        with st.expander(f"All other scheduled tasks, outside this week ({len(outside_week)})"):
-            for day, group in outside_week.groupby(outside_week["Date"].dt.date):
-                label = day.strftime("%A, %B %d, %Y")
-                st.markdown(f"**{label}** ({len(group)})")
-                edited_day = st.data_editor(
-                    group.drop(columns=HIDDEN_COLUMNS, errors="ignore"),
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key=f"day_editor_{day}",
-                    column_config={
-                        "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
-                    },
-                )
-                st.session_state.tasks_df.update(edited_day)
-                save_tasks()
+        outside_week = scheduled[~week_mask]
+        if not outside_week.empty:
+            with st.expander(f"All other scheduled tasks, outside this week ({len(outside_week)})"):
+                for day, group in outside_week.groupby(outside_week["Date"].dt.date):
+                    label = day.strftime("%A, %B %d, %Y")
+                    st.markdown(f"**{label}** ({len(group)})")
+                    edited_day = st.data_editor(
+                        group.drop(columns=HIDDEN_COLUMNS, errors="ignore"),
+                        num_rows="dynamic",
+                        use_container_width=True,
+                        key=f"day_editor_{day}",
+                        column_config={
+                            "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
+                        },
+                    )
+                    st.session_state.tasks_df.update(edited_day)
+                    save_tasks()
