@@ -26,6 +26,10 @@ from schedule_core import (
 
 st.set_page_config(page_title="Daily Schedule Builder", layout="wide")
 
+VIEW_OPTIONS = ["1 Day", "3 Days", "5 Days", "7 Days", "4 Weeks"]
+VIEW_SPANS = {"1 Day": 1, "3 Days": 3, "5 Days": 5, "7 Days": 7, "4 Weeks": 28}
+WEEK_ALIGNED_MODES = {"7 Days", "4 Weeks"}
+
 
 def save_tasks():
     _save_tasks(st.session_state.tasks_df)
@@ -278,67 +282,87 @@ with tab_calendar:
             save_tasks()
 
         st.divider()
-        st.subheader("Weekly calendar")
+        st.subheader("Calendar")
 
-        if "week_start" not in st.session_state:
-            today = pd.Timestamp.today().normalize().date()
-            st.session_state.week_start = today - timedelta(days=today.weekday())
+        if "view_mode" not in st.session_state:
+            st.session_state.view_mode = "7 Days"
+        if "view_start" not in st.session_state:
+            st.session_state.view_start = pd.Timestamp.today().normalize().date()
+
+        def monday_of(d):
+            return d - timedelta(days=d.weekday())
+
+        view_mode = st.segmented_control("Zoom", VIEW_OPTIONS, key="view_mode")
+        if view_mode is None:
+            view_mode = "7 Days"
+            st.session_state.view_mode = view_mode
+        span = VIEW_SPANS[view_mode]
+        week_aligned = view_mode in WEEK_ALIGNED_MODES
 
         nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 5])
-        if nav1.button("◀ Prev week"):
-            st.session_state.week_start -= timedelta(days=7)
+        if nav1.button("◀ Prev"):
+            st.session_state.view_start -= timedelta(days=span)
         if nav2.button("Today"):
-            today = pd.Timestamp.today().normalize().date()
-            st.session_state.week_start = today - timedelta(days=today.weekday())
-        if nav3.button("Next week ▶"):
-            st.session_state.week_start += timedelta(days=7)
+            st.session_state.view_start = pd.Timestamp.today().normalize().date()
+        if nav3.button("Next ▶"):
+            st.session_state.view_start += timedelta(days=span)
 
-        week_start = st.session_state.week_start
-        week_end = week_start + timedelta(days=6)
-        st.caption(f"{week_start.strftime('%B %d')} – {week_end.strftime('%B %d, %Y')}")
+        anchor = monday_of(st.session_state.view_start) if week_aligned else st.session_state.view_start
+        view_end = anchor + timedelta(days=span - 1)
+        st.caption(f"{anchor.strftime('%B %d')} – {view_end.strftime('%B %d, %Y')}")
 
-        week_mask = (scheduled["Date"].dt.date >= week_start) & (scheduled["Date"].dt.date <= week_end)
-        week_df = scheduled[week_mask]
+        view_mask = (scheduled["Date"].dt.date >= anchor) & (scheduled["Date"].dt.date <= view_end)
+        view_df = scheduled[view_mask]
+        today_date = pd.Timestamp.today().normalize().date()
+
+        def render_day_cell(col, day):
+            day_tasks = view_df[view_df["Date"].dt.date == day]
+            with col:
+                is_today = day == today_date
+                fmt = "%A, %B %d" if span == 1 else "%a %-m/%-d"
+                header = f"**{day.strftime(fmt)}**" + (" 🔵" if is_today else "")
+                st.markdown(header)
+                if day_tasks.empty:
+                    st.caption("—")
+                else:
+                    for cat in CATEGORIES:
+                        cat_tasks = day_tasks[day_tasks["Category"] == cat]
+                        if cat_tasks.empty:
+                            continue
+                        emoji = CATEGORY_META[cat]["emoji"]
+                        st.caption(f"{emoji} {cat}")
+                        for _, row in cat_tasks.iterrows():
+                            render_task_capsule(row)
 
         st.markdown(CALENDAR_CSS, unsafe_allow_html=True)
         with st.container(key="calendar_grid"):
-            day_cols = st.columns(7)
-            for i, col in enumerate(day_cols):
-                day = week_start + timedelta(days=i)
-                day_tasks = week_df[week_df["Date"].dt.date == day]
-                with col:
-                    is_today = day == pd.Timestamp.today().normalize().date()
-                    header = f"**{day.strftime('%a %-m/%-d')}**" if not is_today else f"**{day.strftime('%a %-m/%-d')} 🔵**"
-                    st.markdown(header)
-                    if day_tasks.empty:
-                        st.caption("—")
-                    else:
-                        for cat in CATEGORIES:
-                            cat_tasks = day_tasks[day_tasks["Category"] == cat]
-                            if cat_tasks.empty:
-                                continue
-                            emoji = CATEGORY_META[cat]["emoji"]
-                            st.caption(f"{emoji} {cat}")
-                            for _, row in cat_tasks.iterrows():
-                                render_task_capsule(row)
+            if span <= 7:
+                day_cols = st.columns(span)
+                for i, col in enumerate(day_cols):
+                    render_day_cell(col, anchor + timedelta(days=i))
+            else:
+                for week_i in range(span // 7):
+                    week_cols = st.columns(7)
+                    for day_i, col in enumerate(week_cols):
+                        render_day_cell(col, anchor + timedelta(days=week_i * 7 + day_i))
 
-        st.markdown("##### Edit this week's tasks")
-        edited_week = st.data_editor(
-            week_df.drop(columns=HIDDEN_COLUMNS, errors="ignore"),
+        st.markdown("##### Edit tasks in this view")
+        edited_view = st.data_editor(
+            view_df.drop(columns=HIDDEN_COLUMNS, errors="ignore"),
             num_rows="dynamic",
             use_container_width=True,
-            key=f"week_editor_{week_start}",
+            key=f"view_editor_{view_mode}_{anchor}",
             column_config={
                 "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
             },
         )
-        st.session_state.tasks_df.update(edited_week)
+        st.session_state.tasks_df.update(edited_view)
         save_tasks()
 
-        outside_week = scheduled[~week_mask]
-        if not outside_week.empty:
-            with st.expander(f"All other scheduled tasks, outside this week ({len(outside_week)})"):
-                for day, group in outside_week.groupby(outside_week["Date"].dt.date):
+        outside_view = scheduled[~view_mask]
+        if not outside_view.empty:
+            with st.expander(f"All other scheduled tasks, outside this view ({len(outside_view)})"):
+                for day, group in outside_view.groupby(outside_view["Date"].dt.date):
                     label = day.strftime("%A, %B %d, %Y")
                     st.markdown(f"**{label}** ({len(group)})")
                     edited_day = st.data_editor(
