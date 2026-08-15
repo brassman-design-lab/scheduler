@@ -18,8 +18,10 @@ from schedule_core import (
     empty_df,
     guess_category,
     guess_column,
+    load_import_history,
     load_tasks,
     normalize_category,
+    save_import_history as _save_import_history,
     save_tasks as _save_tasks,
     try_parse_date,
 )
@@ -35,12 +37,51 @@ def save_tasks():
     _save_tasks(st.session_state.tasks_df)
 
 
+def save_import_history():
+    _save_import_history(st.session_state.import_history)
+
+
 if "tasks_df" not in st.session_state:
     st.session_state.tasks_df = load_tasks()
+
+if "import_history" not in st.session_state:
+    st.session_state.import_history = load_import_history()
 
 if "expanded_task" not in st.session_state:
     st.session_state.expanded_task = None
 
+if "recent_manual" not in st.session_state:
+    st.session_state.recent_manual = []
+
+
+# Palette/fonts match the "Organic" design system used in the Scheduler Mockups.
+THEME_CSS = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Caprasimo&family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+html, body, [class*="css"] { font-family: 'Figtree', system-ui, sans-serif; }
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Caprasimo', system-ui, sans-serif !important;
+    font-weight: 400 !important;
+    letter-spacing: -0.01em;
+}
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+    border-radius: 999px !important;
+    font-family: 'Figtree', system-ui, sans-serif;
+    font-weight: 600;
+}
+[data-testid="stExpander"] {
+    border-radius: 16px !important;
+    border: 1px solid rgba(32,30,29,.16) !important;
+}
+.stTextInput input, [data-baseweb="select"] > div { border-radius: 999px !important; }
+.stTextArea textarea { border-radius: 16px !important; }
+
+.dsb-legend { display:flex; flex-wrap:wrap; gap:16px; font-size:12px; color:rgba(32,30,29,.6); margin: 4px 0 14px; }
+.dsb-legend-item { display:flex; align-items:center; gap:6px; }
+.dsb-dot { width:9px; height:9px; border-radius:999px; display:inline-block; flex:none; }
+</style>
+"""
 
 CALENDAR_CSS = """
 <style>
@@ -72,20 +113,46 @@ div.st-key-calendar_grid .stMarkdown, div.st-key-calendar_grid .stCaption {
 """
 
 
+def render_legend():
+    items = "".join(
+        f'<span class="dsb-legend-item"><span class="dsb-dot" style="background:{meta["color"]}"></span>{cat}</span>'
+        for cat, meta in CATEGORY_META.items()
+    )
+    st.markdown(f'<div class="dsb-legend">{items}</div>', unsafe_allow_html=True)
+
+
 def render_task_capsule(row):
     task_id = row["_id"]
     is_open = st.session_state.expanded_task == task_id
-    icon = "▾" if is_open else "▸"
-    label = f"{icon} {row['Task']}"
-    if st.button(label, key=f"cap_{task_id}", use_container_width=True):
-        st.session_state.expanded_task = None if is_open else task_id
-        st.rerun()
+    is_done = bool(row["Done"])
+    color = CATEGORY_META[row["Category"]]["color"]
+
+    with st.container(key=f"cap_{task_id}"):
+        done_style = "opacity:.55;text-decoration:line-through;" if is_done else ""
+        st.markdown(
+            f"<style>div.st-key-cap_{task_id} button{{border-left:4px solid {color} !important;{done_style}}}</style>",
+            unsafe_allow_html=True,
+        )
+        chk_col, btn_col = st.columns([0.13, 0.87])
+        new_done = chk_col.checkbox(
+            "Done", value=is_done, key=f"done_{task_id}", label_visibility="collapsed"
+        )
+        if new_done != is_done:
+            idx = st.session_state.tasks_df.index[st.session_state.tasks_df["_id"] == task_id]
+            st.session_state.tasks_df.loc[idx, "Done"] = new_done
+            save_tasks()
+            st.rerun()
+        icon = "▾" if is_open else "▸"
+        if btn_col.button(f"{icon} {row['Task']}", key=f"cap_btn_{task_id}", use_container_width=True):
+            st.session_state.expanded_task = None if is_open else task_id
+            st.rerun()
+
     if is_open:
         with st.container(border=True):
             st.markdown(f"**{row['Task']}**")
-            emoji = CATEGORY_META[row["Category"]]["emoji"]
             date_label = row["Date"].strftime("%b %d, %Y") if pd.notna(row["Date"]) else "Unscheduled"
-            st.caption(f"{emoji} {row['Category']} · {date_label}")
+            status = " · Done" if is_done else ""
+            st.caption(f"{row['Category']} · {date_label}{status}")
             notes = str(row.get("Notes", "") or "").strip()
             if notes:
                 st.write(notes)
@@ -136,7 +203,7 @@ def parse_pdf_lines(uploaded_file):
     return pd.DataFrame(rows, columns=["Task", "Date", "Category"])
 
 
-def append_tasks(task_series, date_series, notes_series, category_series, source):
+def append_tasks(task_series, date_series, notes_series, category_series, source, import_id=""):
     n = len(task_series)
     tasks_list = list(task_series)
     if category_series is not None:
@@ -149,14 +216,56 @@ def append_tasks(task_series, date_series, notes_series, category_series, source
             "Date": [try_parse_date(d) for d in date_series] if date_series is not None else [None] * n,
             "Category": categories,
             "Notes": list(notes_series) if notes_series is not None else [""] * n,
+            "Done": [False] * n,
             "Source": [source] * n,
             "_id": [uuid.uuid4().hex for _ in range(n)],
+            "_import_id": [import_id] * n,
         }
     )
     new_rows = new_rows[new_rows["Task"].astype(str).str.strip() != ""]
     st.session_state.tasks_df = pd.concat([st.session_state.tasks_df, new_rows], ignore_index=True)
     save_tasks()
+    return new_rows
 
+
+def record_import_history(import_id, filename, added_count, skipped_count):
+    entry = pd.DataFrame(
+        [
+            {
+                "import_id": import_id,
+                "filename": filename,
+                "imported_at": pd.Timestamp.now(),
+                "count_added": added_count,
+                "count_skipped": skipped_count,
+            }
+        ]
+    )
+    st.session_state.import_history = pd.concat([st.session_state.import_history, entry], ignore_index=True)
+    save_import_history()
+
+
+def render_import_history():
+    hist = st.session_state.import_history
+    if hist.empty:
+        return
+    st.markdown("##### Import history")
+    st.caption("Undo an import to remove its tasks.")
+    for _, entry in hist.sort_values("imported_at", ascending=False).iterrows():
+        c1, c2 = st.columns([5, 1])
+        ts = pd.Timestamp(entry["imported_at"]).strftime("%b %d, %I:%M %p")
+        skipped = int(entry["count_skipped"]) if pd.notna(entry["count_skipped"]) else 0
+        skipped_note = f" · {skipped} skipped" if skipped else ""
+        c1.markdown(f"**{entry['filename']}** — {ts} · {int(entry['count_added'])} tasks added{skipped_note}")
+        if c2.button("Undo", key=f"undo_import_{entry['import_id']}"):
+            iid = entry["import_id"]
+            st.session_state.tasks_df = st.session_state.tasks_df[st.session_state.tasks_df["_import_id"] != iid]
+            save_tasks()
+            st.session_state.import_history = hist[hist["import_id"] != iid]
+            save_import_history()
+            st.rerun()
+
+
+st.markdown(THEME_CSS, unsafe_allow_html=True)
 
 st.title("Daily Schedule Builder")
 st.caption(
@@ -193,8 +302,12 @@ with tab_upload:
                         },
                     )
                     if st.button(f"Add tasks from {uf.name}", key=f"{key_prefix}_add_pdf"):
-                        append_tasks(edited["Task"], edited["Date"], None, edited["Category"], uf.name)
-                        st.success(f"Added {len(edited)} tasks from {uf.name}.")
+                        import_id = uuid.uuid4().hex
+                        added = append_tasks(
+                            edited["Task"], edited["Date"], None, edited["Category"], uf.name, import_id=import_id
+                        )
+                        record_import_history(import_id, uf.name, len(added), len(edited) - len(added))
+                        st.success(f"Added {len(added)} tasks from {uf.name}.")
                 else:
                     df = read_spreadsheet(uf)
                     if df.empty:
@@ -223,22 +336,51 @@ with tab_upload:
                     if st.button(f"Add tasks from {uf.name}", key=f"{key_prefix}_add_sheet"):
                         notes_series = df[notes_col] if notes_col != "(none)" else None
                         category_series = df[category_col] if category_col != "(auto-detect)" else None
-                        append_tasks(df[task_col], df[date_col], notes_series, category_series, uf.name)
-                        st.success(f"Added {len(df)} tasks from {uf.name}.")
+                        import_id = uuid.uuid4().hex
+                        added = append_tasks(
+                            df[task_col], df[date_col], notes_series, category_series, uf.name, import_id=import_id
+                        )
+                        record_import_history(import_id, uf.name, len(added), len(df) - len(added))
+                        st.success(f"Added {len(added)} tasks from {uf.name}.")
             except Exception as e:
                 st.error(f"Couldn't parse {uf.name}: {e}")
 
+    st.divider()
+    render_import_history()
+
 with tab_manual:
     with st.form("manual_add", clear_on_submit=True):
-        mc1, mc2, mc3, mc4 = st.columns([2, 1, 1.5, 2])
+        mc1, mc2 = st.columns([2, 1])
         m_task = mc1.text_input("Task")
         m_date = mc2.text_input("Date", placeholder="e.g. Aug 10, 2026")
-        m_category = mc3.selectbox("Category", ["Auto-detect"] + CATEGORIES)
-        m_notes = mc4.text_input("Notes")
+        m_category = st.segmented_control("Category", ["Auto-detect"] + CATEGORIES, default="Auto-detect")
+        m_notes = st.text_area("Notes (optional)", height=68)
         if st.form_submit_button("Add task") and m_task.strip():
+            if m_category is None:
+                m_category = "Auto-detect"
             category = None if m_category == "Auto-detect" else [m_category]
-            append_tasks([m_task], [m_date], [m_notes], category, "manual")
+            added = append_tasks([m_task], [m_date], [m_notes], category, "manual")
+            if not added.empty:
+                st.session_state.recent_manual.insert(0, added.iloc[0].to_dict())
+                st.session_state.recent_manual = st.session_state.recent_manual[:5]
             st.success("Task added.")
+
+    if st.session_state.recent_manual:
+        st.divider()
+        st.markdown("##### Just added")
+        for item in list(st.session_state.recent_manual):
+            rc1, rc2, rc3 = st.columns([3, 1.2, 0.8])
+            rc1.markdown(item["Task"])
+            date_val = item.get("Date")
+            date_str = pd.Timestamp(date_val).strftime("%b %d") if pd.notna(date_val) else "no date"
+            rc2.caption(date_str)
+            if rc3.button("Undo", key=f"undo_manual_{item['_id']}"):
+                st.session_state.tasks_df = st.session_state.tasks_df[st.session_state.tasks_df["_id"] != item["_id"]]
+                save_tasks()
+                st.session_state.recent_manual = [
+                    r for r in st.session_state.recent_manual if r["_id"] != item["_id"]
+                ]
+                st.rerun()
 
 with tab_calendar:
     df = st.session_state.tasks_df.copy()
@@ -249,6 +391,11 @@ with tab_calendar:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         unscheduled = df[df["Date"].isna()]
         scheduled = df[df["Date"].notna()].sort_values("Date")
+
+        done_col_config = {
+            "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
+            "Done": st.column_config.CheckboxColumn("Done"),
+        }
 
         top_col1, top_col2 = st.columns([3, 1])
         with top_col2:
@@ -274,15 +421,14 @@ with tab_calendar:
                 num_rows="dynamic",
                 use_container_width=True,
                 key="unscheduled_editor",
-                column_config={
-                    "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
-                },
+                column_config=done_col_config,
             )
             st.session_state.tasks_df.update(edited_unsched)
             save_tasks()
 
         st.divider()
         st.subheader("Calendar")
+        render_legend()
 
         if "view_mode" not in st.session_state:
             st.session_state.view_mode = "7 Days"
@@ -316,7 +462,7 @@ with tab_calendar:
         today_date = pd.Timestamp.today().normalize().date()
 
         def render_day_cell(col, day):
-            day_tasks = view_df[view_df["Date"].dt.date == day]
+            day_tasks = view_df[view_df["Date"].dt.date == day].sort_values("Category")
             with col:
                 is_today = day == today_date
                 fmt = "%A, %B %d" if span == 1 else "%a %-m/%-d"
@@ -325,14 +471,8 @@ with tab_calendar:
                 if day_tasks.empty:
                     st.caption("—")
                 else:
-                    for cat in CATEGORIES:
-                        cat_tasks = day_tasks[day_tasks["Category"] == cat]
-                        if cat_tasks.empty:
-                            continue
-                        emoji = CATEGORY_META[cat]["emoji"]
-                        st.caption(f"{emoji} {cat}")
-                        for _, row in cat_tasks.iterrows():
-                            render_task_capsule(row)
+                    for _, row in day_tasks.iterrows():
+                        render_task_capsule(row)
 
         st.markdown(CALENDAR_CSS, unsafe_allow_html=True)
         with st.container(key="calendar_grid"):
@@ -352,9 +492,7 @@ with tab_calendar:
             num_rows="dynamic",
             use_container_width=True,
             key=f"view_editor_{view_mode}_{anchor}",
-            column_config={
-                "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
-            },
+            column_config=done_col_config,
         )
         st.session_state.tasks_df.update(edited_view)
         save_tasks()
@@ -370,9 +508,7 @@ with tab_calendar:
                         num_rows="dynamic",
                         use_container_width=True,
                         key=f"day_editor_{day}",
-                        column_config={
-                            "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
-                        },
+                        column_config=done_col_config,
                     )
                     st.session_state.tasks_df.update(edited_day)
                     save_tasks()

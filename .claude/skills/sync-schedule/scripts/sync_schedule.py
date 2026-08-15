@@ -91,8 +91,10 @@ def build_new_rows(df, filename):
                 "Date": core.try_parse_date(row[date_col]),
                 "Category": core.normalize_category(category_value, task_text),
                 "Notes": str(row[notes_col]).strip() if notes_col and pd.notna(row[notes_col]) else "",
+                "Done": False,
                 "Source": filename,
                 "_id": row_id,
+                "_import_id": "",
             }
         )
     return pd.DataFrame(rows, columns=core.COLUMNS)
@@ -128,6 +130,11 @@ def main():
     existing = core.load_tasks()
     this_source_old = existing[existing["Source"] == filename]
     other_sources = existing[existing["Source"] != filename]
+
+    # Spreadsheets don't carry a done/undone flag — preserve whatever was already
+    # checked in the app for rows that already existed, instead of resetting to False.
+    old_done_by_id = this_source_old.set_index("_id")["Done"]
+    new_rows["Done"] = new_rows["_id"].map(old_done_by_id).fillna(False).astype(bool)
 
     old_ids = set(this_source_old["_id"])
     new_ids = set(new_rows["_id"])
